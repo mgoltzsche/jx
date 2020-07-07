@@ -2,6 +2,7 @@ package collector
 
 import (
 	"bytes"
+	"io"
 	"io/ioutil"
 	"path/filepath"
 	"time"
@@ -67,8 +68,8 @@ func (c *BucketCollector) CollectFiles(patterns []string, outputPath string, bas
 }
 
 // CollectData collects the data storing it at the given output path and returning the URL to access it
-func (c *BucketCollector) CollectData(data []byte, outputName string) (string, error) {
-	url, err := c.provider.UploadFileToBucket(bytes.NewReader(data), outputName, c.bucketURL)
+func (c *BucketCollector) CollectData(data io.Reader, outputName string) (string, error) {
+	url, err := c.provider.UploadFileToBucket(data, outputName, c.bucketURL)
 	if err != nil {
 		return "", err
 	}

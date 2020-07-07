@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jenkins-x/jx/v2/pkg/auth"
@@ -44,25 +43,21 @@ type TektonLogger struct {
 	JXClient          versioned.Interface
 	TektonClient      tektonclient.Interface
 	KubeClient        kubernetes.Interface
-	LogWriter         LogWriter
 	Namespace         string
-	LogsRetrieverFunc retrieverFunc
-	logsChannel       chan LogLine
-	errorsChannel     chan error
-	wg                *sync.WaitGroup
+	BytesLimit        int64
 	FailIfPodFails    bool
+	LogsRetrieverFunc retrieverFunc
+	err               error
 }
 
-// LogWriter is an interface that can be implemented to define different ways to stream / write logs
-// it's the implementer's responsibility to route those logs through the corresponding medium
-type LogWriter interface {
-	WriteLog(line LogLine, lch chan<- LogLine) error
-	StreamLog(lch <-chan LogLine, ech <-chan error) error
-	BytesLimit() int
+// Err returns the last error that occured during streaming logs.
+// It should be checked after the log stream channel has been closed.
+func (t *TektonLogger) Err() error {
+	return t.err
 }
 
 // retrieverFunc is a func signature used to define the LogsRetrieverFunc in TektonLogger
-type retrieverFunc func(pod *corev1.Pod, container *corev1.Container) (io.Reader, func(), error)
+type retrieverFunc func(pod *corev1.Pod, container *corev1.Container, limitBytes int64, c kubernetes.Interface) (io.ReadCloser, error)
 
 // LogLine is the object sent to and received from the channels in the StreamLog and WriteLog functions
 // defined by LogWriter
@@ -222,7 +217,19 @@ func getPipelineRunsForActivity(pa *v1.PipelineActivity, tektonClient tektonclie
 }
 
 // GetRunningBuildLogs obtains the logs of the provided PipelineActivity and streams the running build pods' logs using the provided LogWriter
-func (t TektonLogger) GetRunningBuildLogs(pa *v1.PipelineActivity, buildName string, noWaitForRuns bool) error {
+func (t *TektonLogger) GetRunningBuildLogs(pa *v1.PipelineActivity, buildName string, noWaitForRuns bool) <-chan LogLine {
+	ch := make(chan LogLine)
+	go func() {
+		defer close(ch)
+		err := t.getRunningBuildLogs(pa, buildName, noWaitForRuns, ch)
+		if err != nil {
+			t.err = err
+		}
+	}()
+	return ch
+}
+
+func (t TektonLogger) getRunningBuildLogs(pa *v1.PipelineActivity, buildName string, noWaitForRuns bool, out chan<- LogLine) error {
 	loggedAllRunsForActivity := false
 	foundLogs := false
 
@@ -291,7 +298,7 @@ func (t TektonLogger) GetRunningBuildLogs(pa *v1.PipelineActivity, buildName str
 						strings.ToLower(params.Branch) == strings.ToLower(pa.Spec.GitBranch) && params.Build == pa.Spec.Build {
 						stagesSeen[stageName] = true
 						foundLogs = true
-						err := t.getContainerLogsFromPod(pod, pa, buildName, stageName)
+						err := t.getContainerLogsFromPod(pod, pa, buildName, stageName, out)
 						if err != nil {
 							return errors.Wrapf(err, "failed to obtain the logs for build %s and stage %s", buildName, stageName)
 						}
@@ -318,31 +325,30 @@ func (t TektonLogger) GetRunningBuildLogs(pa *v1.PipelineActivity, buildName str
 	return nil
 }
 
-func (t *TektonLogger) getContainerLogsFromPod(pod *corev1.Pod, pa *v1.PipelineActivity, buildName string, stageName string) error {
+func (t *TektonLogger) getContainerLogsFromPod(pod *corev1.Pod, pa *v1.PipelineActivity, buildName string, stageName string, out chan<- LogLine) error {
 	infoColor := color.New(color.FgGreen)
 	infoColor.EnableColor()
 	errorColor := color.New(color.FgRed)
 	errorColor.EnableColor()
 	containers, _, _ := kube.GetContainersWithStatusAndIsInit(pod)
-	t.initializeLoggingRoutine()
 	for i, initContainer := range containers {
 		ic := initContainer
-		pod, err := t.waitForContainerToStart(pa.Namespace, pod, i, stageName)
-		err = t.LogWriter.WriteLog(LogLine{
+		pod, err := t.waitForContainerToStart(pa.Namespace, pod, i, stageName, out)
+		out <- LogLine{
 			Line: fmt.Sprintf("\nShowing logs for build %v stage %s and container %s",
 				infoColor.Sprintf(buildName), infoColor.Sprintf(stageName), infoColor.Sprintf(ic.Name)),
-		}, t.logsChannel)
+		}
 		if err != nil {
 			return errors.Wrapf(err, "there was a problem writing a single line into the logs writer")
 		}
-		err = t.fetchLogsToChannel(pa.Namespace, pod, &ic)
+		err = t.fetchLogsToChannel(pa.Namespace, pod, &ic, out)
 		if err != nil {
 			return errors.Wrap(err, "couldn't fetch logs into the logs channel")
 		}
 		if hasStepFailed(pod, i, t.KubeClient, pa.Namespace) {
-			err = t.LogWriter.WriteLog(LogLine{
+			out <- LogLine{
 				Line: errorColor.Sprintf("\nPipeline failed on stage '%s' : container '%s'. The execution of the pipeline has stopped.", stageName, ic.Name),
-			}, t.logsChannel)
+			}
 			if err != nil {
 				return err
 			}
@@ -352,45 +358,24 @@ func (t *TektonLogger) getContainerLogsFromPod(pod *corev1.Pod, pa *v1.PipelineA
 			break
 		}
 	}
-	// We are done using the logs and errors channels, any message in the channels should still be read before calling wg.Done()
-	t.closeLoggingChannels()
-	// Waiting so we don't finish the main routine before waiting for all traces to be printed
-	t.wg.Wait()
 	return nil
 }
 
-func (t *TektonLogger) syncStreamLog() {
-	err := t.LogWriter.StreamLog(t.logsChannel, t.errorsChannel)
-	if err != nil {
-		log.Logger().Error(err)
+func (t *TektonLogger) fetchLogsToChannel(ns string, pod *corev1.Pod, container *corev1.Container, out chan<- LogLine) error {
+	logsRetrieverFunc := t.LogsRetrieverFunc
+	if logsRetrieverFunc == nil {
+		logsRetrieverFunc = retrieveLogsFromPod
 	}
-	defer t.wg.Done()
-}
-
-func (t *TektonLogger) fetchLogsToChannel(ns string, pod *corev1.Pod, container *corev1.Container) error {
-
-	if t.LogsRetrieverFunc == nil {
-		t.LogsRetrieverFunc = t.retrieveLogsFromPod
-	}
-
-	reader, cleanFN, err := t.LogsRetrieverFunc(pod, container)
-	if err != nil {
-		t.errorsChannel <- err
-		return err
-	}
-	defer cleanFN()
-	err = writeStreamLines(reader, t.logsChannel)
+	reader, err := logsRetrieverFunc(pod, container, t.BytesLimit, t.KubeClient)
 	if err != nil {
 		return err
 	}
-	return nil
+	defer reader.Close()
+	return writeStreamLines(reader, out)
 }
 
-func writeStreamLines(reader io.Reader, logCh chan<- LogLine) error {
+func writeStreamLines(reader io.Reader, out chan<- LogLine) error {
 	buffReader := bufio.NewReader(reader)
-	if buffReader == nil {
-		return errors.New("there was a problem obtaining a buffered reader")
-	}
 	for {
 		line, _, err := buffReader.ReadLine()
 		if err != nil {
@@ -399,7 +384,7 @@ func writeStreamLines(reader io.Reader, logCh chan<- LogLine) error {
 			}
 			return errors.Wrap(err, "failed to read stream")
 		}
-		logCh <- LogLine{Line: string(line), ShouldMask: true}
+		out <- LogLine{Line: string(line), ShouldMask: true}
 	}
 }
 
@@ -416,7 +401,7 @@ func hasStepFailed(pod *corev1.Pod, stepNumber int, kubeClient kubernetes.Interf
 	return false
 }
 
-func (t TektonLogger) waitForContainerToStart(ns string, pod *corev1.Pod, idx int, stageName string) (*corev1.Pod, error) {
+func (t TektonLogger) waitForContainerToStart(ns string, pod *corev1.Pod, idx int, stageName string, out chan<- LogLine) (*corev1.Pod, error) {
 	if pod.Status.Phase == corev1.PodFailed {
 		return pod, nil
 	}
@@ -431,10 +416,8 @@ func (t TektonLogger) waitForContainerToStart(ns string, pod *corev1.Pod, idx in
 	// This method will be executed by both the CLI and the UI, we don't know if the UI has color enabled, so we are using a local instance instead of the global one
 	c := color.New(color.FgGreen)
 	c.EnableColor()
-	if err := t.LogWriter.WriteLog(LogLine{
+	out <- LogLine{
 		Line: fmt.Sprintf("\nwaiting for stage %s : container %s to start...\n", c.Sprintf(stageName), c.Sprintf(containerName)),
-	}, t.logsChannel); err != nil {
-		log.Logger().Warn("There was a problem writing a single line into the writeFN")
 	}
 	for {
 		time.Sleep(time.Second)
@@ -449,8 +432,19 @@ func (t TektonLogger) waitForContainerToStart(ns string, pod *corev1.Pod, idx in
 }
 
 // StreamPipelinePersistentLogs reads logs from the provided bucket URL and writes them using the provided LogWriter
-func (t *TektonLogger) StreamPipelinePersistentLogs(logsURL string, jxClient versioned.Interface, ns string, authSvc auth.ConfigService) error {
-	t.initializeLoggingRoutine()
+func (t *TektonLogger) StreamPipelinePersistentLogs(logsURL string, authSvc auth.ConfigService) <-chan LogLine {
+	ch := make(chan LogLine)
+	go func() {
+		defer close(ch)
+		err := t.streamPipelinePersistentLogs(logsURL, authSvc, ch)
+		if err != nil {
+			t.err = err
+		}
+	}()
+	return ch
+}
+
+func (t *TektonLogger) streamPipelinePersistentLogs(logsURL string, authSvc auth.ConfigService, out chan<- LogLine) error {
 	u, err := url.Parse(logsURL)
 	if err != nil {
 		return errors.Wrapf(err, "unable to parse logs URL %s to retrieve scheme", logsURL)
@@ -458,114 +452,73 @@ func (t *TektonLogger) StreamPipelinePersistentLogs(logsURL string, jxClient ver
 	var logBytes []byte
 	switch u.Scheme {
 	case "gs":
-		scanner, err := performProviderDownload(logsURL, jxClient, ns)
+		scanner, err := performProviderDownload(logsURL, t.JXClient, t.Namespace)
 		if err != nil {
 			// TODO: This is only here as long as we keep supporting non boot clusters, as GKE are the only ones with LTS supported outside of boot
 			scanner, err2 := gke.StreamTransferFileFromBucket(logsURL)
 			if err2 != nil {
 				return errorutil.CombineErrors(err, err2)
 			}
-			return t.streamPipedLogs(scanner, logsURL)
+			return t.streamPipedLogs(scanner, out)
 		}
-		return t.streamPipedLogs(scanner, logsURL)
+		return t.streamPipedLogs(scanner, out)
 	case "s3":
-		scanner, err := performProviderDownload(logsURL, jxClient, ns)
+		scanner, err := performProviderDownload(logsURL, t.JXClient, t.Namespace)
 		if err != nil {
 			return errors.Wrap(err, "there was a problem downloading logs from s3 bucket")
 		}
-		return t.streamPipedLogs(scanner, logsURL)
+		return t.streamPipedLogs(scanner, out)
 	case "http", "https":
+		// TODO: avoid loading whole log into memory
 		logBytes, err = downloadLogFile(logsURL, authSvc)
 		if err != nil {
 			return errors.Wrapf(err, "there was a problem obtaining the log file from the github pages URL %s", logsURL)
 		}
 	default:
-		return t.writeBlockingLine(LogLine{
+		out <- LogLine{
 			Line: fmt.Sprintf("The provided logsURL scheme is not supported: %s", u.Scheme),
-		})
+		}
+		return nil
 	}
 
 	if len(logBytes) == 0 {
-		return t.writeBlockingLine(LogLine{
+		out <- LogLine{
 			Line: "The build pods for this build have been garbage collected and we couldn't find the any stored log file",
-		})
+		}
+		return nil
 	}
-	return t.writeBlockingLine(LogLine{
+	out <- LogLine{
 		Line: string(logBytes),
-	})
-}
-
-func (t *TektonLogger) streamPipedLogs(scanner *bufio.Scanner, logsURL string) error {
-	for scanner.Scan() {
-		text := scanner.Text()
-		err := t.LogWriter.WriteLog(LogLine{
-			Line: text,
-		}, t.logsChannel)
-
-		if err != nil {
-			return errors.Wrapf(err, "there was a problem streaming the log file from the GKE bucket %s", logsURL)
-		}
-
-		if t.FailIfPodFails {
-			if strings.Contains(text, "The execution of the pipeline has stopped.") {
-				return errors.New("The execution of the pipeline has stopped.")
-			}
-		}
 	}
 	return nil
 }
 
-// create the logs and errors channels and the waitgroup for this TektonLogger instance
-// assign a pointer to the waitgroup to TektonLogger which will be used by all other methods
-// then start the log writing goroutine, which calls the implementation of StreamLogs of the given LogWriter
-func (t *TektonLogger) initializeLoggingRoutine() {
-	t.logsChannel = make(chan LogLine)
-	t.errorsChannel = make(chan error)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	t.wg = &wg
-	go t.syncStreamLog()
-}
-
-func (t *TektonLogger) closeLoggingChannels() {
-	close(t.logsChannel)
-	close(t.errorsChannel)
-}
-
-// send a line to the main logs channel, close the logging channel and wait
-// any message still in the channel should be read even if closed
-func (t *TektonLogger) writeBlockingLine(line LogLine) error {
-	err := t.LogWriter.WriteLog(line, t.logsChannel)
-	if err != nil {
-		return err
+func (t *TektonLogger) streamPipedLogs(scanner *bufio.Scanner, out chan<- LogLine) error {
+	for scanner.Scan() {
+		text := scanner.Text()
+		out <- LogLine{Line: text}
+		if t.FailIfPodFails && strings.Contains(text, "The execution of the pipeline has stopped.") {
+			return errors.New("the execution of the pipeline has stopped")
+		}
 	}
-	t.closeLoggingChannels()
-	t.wg.Wait()
 	return nil
 }
 
 // Uses the same signature as retrieverFunc so it can be used in TektonLogger
-func (t TektonLogger) retrieveLogsFromPod(pod *corev1.Pod, container *corev1.Container) (io.Reader, func(), error) {
+func retrieveLogsFromPod(pod *corev1.Pod, container *corev1.Container, limitBytes int64, client kubernetes.Interface) (io.ReadCloser, error) {
 	options := &corev1.PodLogOptions{
 		Container: container.Name,
 		Follow:    true,
 	}
-	bytesLimit := t.LogWriter.BytesLimit()
-	if bytesLimit > 0 {
-		a := int64(bytesLimit)
-		options.LimitBytes = &a
+	if limitBytes > 0 {
+		options.LimitBytes = &limitBytes
 	}
-	req := t.KubeClient.CoreV1().Pods(t.Namespace).GetLogs(pod.Name, options)
+	req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, options)
 	stream, err := req.Stream()
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "there was an error creating the logs stream for pod %s", pod.Name)
+		return nil, errors.Wrapf(err, "there was an error creating the logs stream for pod %s", pod.Name)
 	}
-	reader := bufio.NewReader(stream)
-	return reader, func() {
-		if stream != nil {
-			stream.Close()
-		}
-	}, nil
+	return stream, nil
 }
 
 func downloadLogFile(logsURL string, authSvc auth.ConfigService) ([]byte, error) {
